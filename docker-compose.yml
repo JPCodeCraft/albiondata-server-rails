@@ -6,12 +6,13 @@ services:
     environment:
       MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PWD}
     ports:
-      - 3306:3306
+      - 3307:3306
     volumes:
       - ./mysqldata:/var/lib/mysql
       - ./mysqlbackup:/mysqlbackup
     networks:
       - albiondata
+
   web:
     image: ruby:3
     build:
@@ -21,6 +22,7 @@ services:
     restart: on-failure
     volumes:
       - ./:/rails
+      - ./scripts:/scripts
     environment:
       RAILS_ENV: development
 
@@ -72,8 +74,8 @@ services:
       DEBUG: "true"
       ADDITIONAL_MESSAGE_CONTENT: ${ADDITIONAL_MESSAGE_CONTENT}
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL}
-    # command: './entrypoint.sh web'
-    entrypoint: ./entrypoint.sh sleep
+    command: '/rails/entrypoint.sh web'
+    # entrypoint: ./entrypoint.sh sleep
     ports:
       - 3000:3000
     depends_on:
@@ -84,6 +86,81 @@ services:
     logging:
       options:
         tag: "{{.ImageName}}/{{.Name}}/{{.ID}}"
+
+  sidekiq:
+    image: ruby:3
+    build:
+      context: .
+    platform: linux/amd64
+    container_name: sidekiq
+    restart: on-failure
+    volumes:
+      - ./:/rails
+      - ./scripts:/scripts
+    environment:
+      RAILS_ENV: development
+
+      MYSQL_WEST_URL: ${MYSQL_WEST_URL}
+      MYSQL_WEST_HOST: ${MYSQL_WEST_HOST}
+      MYSQL_WEST_USER: ${MYSQL_WEST_USER}
+      MYSQL_WEST_PASS: ${MYSQL_WEST_PASS}
+      MYSQL_WEST_DB: ${MYSQL_WEST_DB}
+      MYSQL_WEST_EXPORT_PATH: ${MYSQL_WEST_EXPORT_PATH}
+
+      MYSQL_EAST_URL: ${MYSQL_EAST_URL}
+      MYSQL_EAST_HOST: ${MYSQL_EAST_HOST}
+      MYSQL_EAST_USER: ${MYSQL_EAST_USER}
+      MYSQL_EAST_PASS: ${MYSQL_EAST_PASS}
+      MYSQL_EAST_DB: ${MYSQL_EAST_DB}
+      MYSQL_EAST_EXPORT_PATH: ${MYSQL_EAST_EXPORT_PATH}
+
+      MYSQL_EUROPE_URL: ${MYSQL_EUROPE_URL}
+      MYSQL_EUROPE_HOST: ${MYSQL_EUROPE_HOST}
+      MYSQL_EUROPE_USER: ${MYSQL_EUROPE_USER}
+      MYSQL_EUROPE_PASS: ${MYSQL_EUROPE_PASS}
+      MYSQL_EUROPE_DB: ${MYSQL_EUROPE_DB}
+      MYSQL_EUROPE_EXPORT_PATH: ${MYSQL_EUROPE_EXPORT_PATH}
+
+      NATS_WEST_URL: ${NATS_WEST_URL}
+      NATS_EAST_URL: ${NATS_EAST_URL}
+      NATS_EUROPE_URL: ${NATS_EUROPE_URL}
+      NATS_SEND_DISABLE: ${NATS_SEND_DISABLE}
+      SIDEKIQ_REDIS_URL: ${SIDEKIQ_REDIS_URL}
+      SIDEKIQ_THREADS: 10
+      SIDEKIQ_WEB_USER: ${SIDEKIQ_WEB_USER}
+      SIDEKIQ_WEB_PASS: ${SIDEKIQ_WEB_PASS}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      REDIS_WEST_URL: ${REDIS_WEST_URL}
+      REDIS_EAST_URL: ${REDIS_EAST_URL}
+      REDIS_EUROPE_URL: ${REDIS_EUROPE_URL}
+      ABUSEIPDB_REDIS_URL: ${ABUSEIPDB_REDIS_URL}
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY}
+      RACKATTACK_REDIS_URL: ${RACKATTACK_REDIS_URL:-redis://redis:6379/9}
+      THROTTLE_API_1MIN: ${THROTTLE_API_1MIN}
+      THROTTLE_API_5MIN: ${THROTTLE_API_5MIN}
+      THROTTLE_POW_1MIN: ${THROTTLE_POW_1MIN}
+      THROTTLE_POW_1HOUR: ${THROTTLE_POW_1HOUR}
+      THROTTLE_POW_1DAY: ${THROTTLE_POW_1DAY}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS}
+      RUBY_YJIT_ENABLE: 0
+      RAILS_MAX_THREADS: 5
+      WEB_CONCURRENCY: 2
+      DEBUG: "true"
+      ADDITIONAL_MESSAGE_CONTENT: ${ADDITIONAL_MESSAGE_CONTENT}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL}
+    command: '/rails/entrypoint.sh sidekiq'
+    # entrypoint: ./entrypoint.sh sleep
+    ports:
+      - 3001:3001
+    depends_on:
+      - redis
+      - mysql
+    networks:
+      - albiondata
+    logging:
+      options:
+        tag: "{{.ImageName}}/{{.Name}}/{{.ID}}"
+
   redis:
     image: redis
     container_name: redis
@@ -95,5 +172,6 @@ services:
     command: redis-server --appendonly yes
     networks:
       - albiondata
+
 networks:
   albiondata:

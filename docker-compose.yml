@@ -1,4 +1,5 @@
 services:
+
   mysql:
     image: mariadb:10.5.10
     container_name: aodata-mysql
@@ -74,7 +75,12 @@ services:
       DEBUG: "true"
       ADDITIONAL_MESSAGE_CONTENT: ${ADDITIONAL_MESSAGE_CONTENT}
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL}
-    command: '/rails/entrypoint.sh web'
+    command: 
+      - /bin/sh
+      - -c
+      - |
+        rm -f /rails/tmp/pids/server.pid
+        /rails/entrypoint.sh web
     # entrypoint: ./entrypoint.sh sleep
     ports:
       - 3000:3000

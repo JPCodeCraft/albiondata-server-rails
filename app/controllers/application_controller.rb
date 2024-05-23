@@ -7,7 +7,7 @@ class ApplicationController < ActionController::Base
   end
 
   def server_id
-    'west'
+    request.subdomain.split('.').last
   end
 
   def run_using_database(&block)

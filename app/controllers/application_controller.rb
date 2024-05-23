@@ -3,7 +3,7 @@ class ApplicationController < ActionController::Base
 
   def test
     # this only here for spec testing run_using_database
-    render json: { orders: MarketOrder.all.limit(10) }.to_json
+    render json: { orders: MarketOrder.order(updated_at: :desc).limit(10) }.to_json
   end
 
   def server_id

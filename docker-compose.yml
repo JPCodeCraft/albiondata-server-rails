@@ -60,6 +60,7 @@ services:
       REDIS_WEST_URL: ${REDIS_WEST_URL}
       REDIS_EAST_URL: ${REDIS_EAST_URL}
       REDIS_EUROPE_URL: ${REDIS_EUROPE_URL}
+      REDIS_IDENTIFIER_URL: ${REDIS_IDENTIFIER_URL:-redis://redis:6379/7}
       ABUSEIPDB_REDIS_URL: ${ABUSEIPDB_REDIS_URL}
       ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY}
       RACKATTACK_REDIS_URL: ${RACKATTACK_REDIS_URL:-redis://redis:6379/9}
@@ -83,7 +84,7 @@ services:
         /rails/entrypoint.sh web
     # entrypoint: ./entrypoint.sh sleep
     ports:
-      - 3001:3001
+      - 3000:3000
     depends_on:
       - redis
       - mysql
@@ -139,6 +140,7 @@ services:
       REDIS_WEST_URL: ${REDIS_WEST_URL}
       REDIS_EAST_URL: ${REDIS_EAST_URL}
       REDIS_EUROPE_URL: ${REDIS_EUROPE_URL}
+      REDIS_IDENTIFIER_URL: ${REDIS_IDENTIFIER_URL:-redis://redis:6379/7}
       ABUSEIPDB_REDIS_URL: ${ABUSEIPDB_REDIS_URL}
       ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY}
       RACKATTACK_REDIS_URL: ${RACKATTACK_REDIS_URL:-redis://redis:6379/9}

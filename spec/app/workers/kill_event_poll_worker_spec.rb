@@ -8,4 +8,8 @@ RSpec.describe KillEventPollWorker, type: :worker do
 
     subject.perform('west')
   end
+
+  it 'runs on the gameinfo queue without retries' do
+    expect(described_class.get_sidekiq_options).to include('queue' => :gameinfo, 'retry' => false)
+  end
 end

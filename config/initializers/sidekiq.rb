@@ -70,37 +70,43 @@ cron_jobs = [
     'name'  => 'kill-event-poll-west',
     'class' => 'KillEventPollWorker',
     'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
-    'args'  => 'west'
+    'args'  => 'west',
+    'queue' => 'gameinfo'
   },
   {
     'name'  => 'kill-event-poll-east',
     'class' => 'KillEventPollWorker',
     'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
-    'args'  => 'east'
+    'args'  => 'east',
+    'queue' => 'gameinfo'
   },
   {
     'name'  => 'kill-event-poll-europe',
     'class' => 'KillEventPollWorker',
     'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
-    'args'  => 'europe'
+    'args'  => 'europe',
+    'queue' => 'gameinfo'
   },
   {
     'name'  => 'battle-poll-west',
     'class' => 'BattlePollWorker',
     'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
-    'args'  => 'west'
+    'args'  => 'west',
+    'queue' => 'gameinfo'
   },
   {
     'name'  => 'battle-poll-east',
     'class' => 'BattlePollWorker',
     'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
-    'args'  => 'east'
+    'args'  => 'east',
+    'queue' => 'gameinfo'
   },
   {
     'name'  => 'battle-poll-europe',
     'class' => 'BattlePollWorker',
     'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
-    'args'  => 'europe'
+    'args'  => 'europe',
+    'queue' => 'gameinfo'
   },
 ]
 

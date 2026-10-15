@@ -43,13 +43,49 @@ RSpec.describe GameinfoService, type: :service do
     end
 
     it 'stops at the max offset' do
-      event_id = 0
-      allow(HTTParty).to receive(:get) { response(200, [event(event_id += 1)].to_json) }
+      event_ids = Queue.new
+      (1..100).each { |id| event_ids << id }
+      allow(HTTParty).to receive(:get) { response(200, [event(event_ids.pop)].to_json) }
 
       subject.poll_events
 
       expect(HTTParty).to have_received(:get).exactly(20).times
       expect(HTTParty).to have_received(:get).with(events_url(969), anything)
+      expect(Sidekiq.logger).to have_received(:info).with(/older events were missed/)
+    end
+
+    it 'fetches the next pages in parallel once a page has only new events' do
+      in_flight = 0
+      max_in_flight = 0
+      lock = Mutex.new
+      allow(HTTParty).to receive(:get) do |url, **_options|
+        lock.synchronize { max_in_flight = [max_in_flight, in_flight += 1].max }
+        Kernel.sleep(0.2)
+        lock.synchronize { in_flight -= 1 }
+        response(200, pages.fetch(url, []).to_json)
+      end
+      pages[events_url(0)] = [event(6), event(5)]
+      pages[events_url(51)] = [event(4), event(3)]
+      pages[events_url(102)] = [event(2), event(1)]
+      subject.poll_events
+
+      expect(max_in_flight).to eq(4)
+      [0, 51, 102, 153, 204].each { |offset| expect(HTTParty).to have_received(:get).with(events_url(offset), anything).once }
+      expect(nats).to have_received(:send).exactly(6).times
+    end
+
+    it 'fetches one page at a time when it is not behind' do
+      pages[events_url(0)] = [event(2), event(1)]
+      pages[events_url(51)] = [event(1)]
+      subject.poll_events
+
+      pages[events_url(0)] = [event(4), event(3), event(2)]
+      pages[events_url(51)] = [event(1)]
+      subject.poll_events
+
+      expect(HTTParty).to have_received(:get).with(events_url(0), anything).twice
+      expect(HTTParty).to have_received(:get).with(events_url(51), anything).twice
+      expect(HTTParty).to have_received(:get).with(events_url(102), anything).once
     end
 
     it 'tracks the battle of each new event' do
@@ -98,11 +134,11 @@ RSpec.describe GameinfoService, type: :service do
       subject.poll_events
 
       cache_breakers = []
-      expect(HTTParty).to have_received(:get).twice do |_url, **options|
+      expect(HTTParty).to have_received(:get).exactly(5).times do |_url, **options|
         cache_breakers << options.dig(:query, :_)
       end
       expect(cache_breakers).to all(match(/\A\h{16}\z/))
-      expect(cache_breakers.uniq.size).to eq(2)
+      expect(cache_breakers.uniq.size).to eq(5)
     end
 
     it 'retries rate limited requests' do

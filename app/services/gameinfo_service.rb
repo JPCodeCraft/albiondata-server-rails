@@ -11,6 +11,7 @@ class GameinfoService
   PAGE_SIZE = 51
   # The events feed rejects offsets above 1000.
   EVENTS_MAX_OFFSET = 1000
+  EVENTS_PARALLEL_PAGES = ENV.fetch('GAMEINFO_EVENTS_PARALLEL_PAGES', 4).to_i
   BATTLES_MAX_OFFSET = ENV.fetch('GAMEINFO_BATTLES_MAX_OFFSET', 500).to_i
 
   LOCK_TTL_SECONDS = ENV.fetch('GAMEINFO_LOCK_TTL_SECONDS', 180).to_i
@@ -37,25 +38,36 @@ class GameinfoService
     @redis = REDIS[server_id]
   end
 
+  # Pages through the feed until a page has nothing new. A page with only new events means the
+  # run is behind, so the next pages are then fetched EVENTS_PARALLEL_PAGES at a time.
   def poll_events
     with_lock('events') do
       published = 0
       offset = 0
+      pages_at_once = 1
+      done = false
 
-      while offset <= EVENTS_MAX_OFFSET && time_left?
-        events = get_json("/api/gameinfo/events?limit=#{PAGE_SIZE}&offset=#{offset}")
-        break unless events.is_a?(Array) && events.any?
+      while !done && offset <= EVENTS_MAX_OFFSET && time_left?
+        offsets = (0...pages_at_once).map { |i| offset + i * PAGE_SIZE }.select { |o| o <= EVENTS_MAX_OFFSET }
+        pages = get_json_in_parallel(offsets.map { |o| "/api/gameinfo/events?limit=#{PAGE_SIZE}&offset=#{o}" })
+        offset = offsets.last + PAGE_SIZE
 
-        new_events = events.select { |event| publish_once(kill_event_key(event['EventId']), KILL_EVENTS_TOPIC, event) }
-        new_events.each { |event| track_battle(event) }
-        published += new_events.size
-        break if new_events.empty?
+        pages.each do |events|
+          unless events.is_a?(Array) && events.any?
+            done = true
+            next
+          end
 
-        offset += PAGE_SIZE
+          new_events = events.select { |event| publish_once(kill_event_key(event['EventId']), KILL_EVENTS_TOPIC, event) }
+          new_events.each { |event| track_battle(event) }
+          published += new_events.size
+          done = true if new_events.empty?
+          pages_at_once = EVENTS_PARALLEL_PAGES if new_events.size == events.size
+        end
       end
 
       log('poll_events', published: published, offset: offset, timed_out: !time_left?)
-      log('poll_events', message: 'every page up to the max offset had new events, older events were missed') if offset > EVENTS_MAX_OFFSET
+      log('poll_events', message: 'every page up to the max offset had new events, older events were missed') if !done && offset > EVENTS_MAX_OFFSET
     end
   end
 
@@ -137,6 +149,11 @@ class GameinfoService
   rescue StandardError
     @redis.del(key)
     raise
+  end
+
+  # Only the HTTP calls run in threads; the results are handled in order on the job's thread.
+  def get_json_in_parallel(paths)
+    paths.map { |path| Thread.new { get_json(path) } }.map(&:value)
   end
 
   # Returns the parsed body, :not_found on 404, or nil when the request failed.

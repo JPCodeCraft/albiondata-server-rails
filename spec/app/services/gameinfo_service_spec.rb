@@ -93,6 +93,18 @@ RSpec.describe GameinfoService, type: :service do
       expect(nats).to have_received(:close)
     end
 
+    it 'adds a different cache breaker to every request' do
+      pages[events_url(0)] = [event(1)]
+      subject.poll_events
+
+      cache_breakers = []
+      expect(HTTParty).to have_received(:get).twice do |_url, **options|
+        cache_breakers << options.dig(:query, :_)
+      end
+      expect(cache_breakers).to all(match(/\A\h{16}\z/))
+      expect(cache_breakers.uniq.size).to eq(2)
+    end
+
     it 'retries rate limited requests' do
       allow(HTTParty).to receive(:get).and_return(response(429, ''), response(200, [event(1)].to_json), response(200, [].to_json))
       subject.poll_events

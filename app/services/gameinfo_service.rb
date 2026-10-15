@@ -138,6 +138,8 @@ class GameinfoService
 
   # Returns the parsed body, :not_found on 404, or nil when the request failed.
   # Rate limits (429), server errors and network errors are retried with a backoff.
+  # The random `_` parameter skips the API's response cache, which serves each page URL
+  # from a copy up to ~2 minutes old and makes consecutive pages come from different moments.
   def get_json(path)
     MAX_ATTEMPTS.times do |attempt|
       if attempt > 0
@@ -145,7 +147,7 @@ class GameinfoService
         sleep(2**attempt)
       end
 
-      response = HTTParty.get("#{BASE_URLS.fetch(@server_id)}#{path}", headers: { 'User-Agent' => 'AlbionDataServer' }, timeout: HTTP_TIMEOUT_SECONDS)
+      response = HTTParty.get("#{BASE_URLS.fetch(@server_id)}#{path}", query: { _: SecureRandom.hex(8) }, headers: { 'User-Agent' => 'AlbionDataServer' }, timeout: HTTP_TIMEOUT_SECONDS)
       return JSON.parse(response.body) if response.success?
       return :not_found if response.code == 404
 

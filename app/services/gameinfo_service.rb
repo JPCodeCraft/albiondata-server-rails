@@ -15,7 +15,10 @@ class GameinfoService
 
   LOCK_TTL_SECONDS = ENV.fetch('GAMEINFO_LOCK_TTL_SECONDS', 180).to_i
   MAX_RUNTIME_SECONDS = ENV.fetch('GAMEINFO_MAX_RUNTIME_SECONDS', 90).to_i
-  HTTP_TIMEOUT_SECONDS = 15
+  # The API is often slow. A run stops starting requests after MAX_RUNTIME_SECONDS, so its worst case
+  # is MAX_RUNTIME_SECONDS + HTTP_OPEN_TIMEOUT_SECONDS + HTTP_READ_TIMEOUT_SECONDS, within LOCK_TTL_SECONDS.
+  HTTP_OPEN_TIMEOUT_SECONDS = 10
+  HTTP_READ_TIMEOUT_SECONDS = ENV.fetch('GAMEINFO_HTTP_READ_TIMEOUT_SECONDS', 60).to_i
   MAX_ATTEMPTS = 3
   SEEN_TTL_SECONDS = 1.day.to_i
 
@@ -147,7 +150,11 @@ class GameinfoService
         sleep(2**attempt)
       end
 
-      response = HTTParty.get("#{BASE_URLS.fetch(@server_id)}#{path}", query: { _: SecureRandom.hex(8) }, headers: { 'User-Agent' => 'AlbionDataServer' }, timeout: HTTP_TIMEOUT_SECONDS)
+      response = HTTParty.get("#{BASE_URLS.fetch(@server_id)}#{path}",
+                              query: { _: SecureRandom.hex(8) },
+                              headers: { 'User-Agent' => 'AlbionDataServer' },
+                              open_timeout: HTTP_OPEN_TIMEOUT_SECONDS,
+                              read_timeout: HTTP_READ_TIMEOUT_SECONDS)
       return JSON.parse(response.body) if response.success?
       return :not_found if response.code == 404
 

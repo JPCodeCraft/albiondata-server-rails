@@ -15,9 +15,11 @@ class GameinfoService
   BATTLES_MAX_OFFSET = ENV.fetch('GAMEINFO_BATTLES_MAX_OFFSET', 500).to_i
 
   LOCK_TTL_SECONDS = ENV.fetch('GAMEINFO_LOCK_TTL_SECONDS', 180).to_i
-  MAX_RUNTIME_SECONDS = ENV.fetch('GAMEINFO_MAX_RUNTIME_SECONDS', 90).to_i
-  # The API is often slow. A run stops starting requests after MAX_RUNTIME_SECONDS, so its worst case
-  # is MAX_RUNTIME_SECONDS + HTTP_OPEN_TIMEOUT_SECONDS + HTTP_READ_TIMEOUT_SECONDS, within LOCK_TTL_SECONDS.
+  MAX_RUNTIME_SECONDS = ENV.fetch('GAMEINFO_MAX_RUNTIME_SECONDS', 60).to_i
+  # The API is often slow. A run stops starting requests after MAX_RUNTIME_SECONDS, but a request in
+  # flight can still take HTTP_OPEN_TIMEOUT_SECONDS + HTTP_READ_TIMEOUT_SECONDS or more (the read timeout
+  # applies to each read, so a slowly streamed response can take longer). A slow West run took 177s with a
+  # 90s limit, so the limit leaves ~2 minutes of margin within LOCK_TTL_SECONDS.
   HTTP_OPEN_TIMEOUT_SECONDS = 10
   HTTP_READ_TIMEOUT_SECONDS = ENV.fetch('GAMEINFO_HTTP_READ_TIMEOUT_SECONDS', 60).to_i
   MAX_ATTEMPTS = 3

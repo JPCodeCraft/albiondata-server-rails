@@ -66,6 +66,42 @@ cron_jobs = [
     'cron'  => '*/30 * * * *',
     'queue' => 'low'
   },
+  {
+    'name'  => 'kill-event-poll-west',
+    'class' => 'KillEventPollWorker',
+    'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
+    'args'  => 'west'
+  },
+  {
+    'name'  => 'kill-event-poll-east',
+    'class' => 'KillEventPollWorker',
+    'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
+    'args'  => 'east'
+  },
+  {
+    'name'  => 'kill-event-poll-europe',
+    'class' => 'KillEventPollWorker',
+    'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
+    'args'  => 'europe'
+  },
+  {
+    'name'  => 'battle-poll-west',
+    'class' => 'BattlePollWorker',
+    'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
+    'args'  => 'west'
+  },
+  {
+    'name'  => 'battle-poll-east',
+    'class' => 'BattlePollWorker',
+    'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
+    'args'  => 'east'
+  },
+  {
+    'name'  => 'battle-poll-europe',
+    'class' => 'BattlePollWorker',
+    'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
+    'args'  => 'europe'
+  },
 ]
 
 Sidekiq::Cron::Job.load_from_array(cron_jobs) unless ENV['SECRET_KEY_BASE_DUMMY']

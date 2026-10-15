@@ -129,6 +129,35 @@ RSpec.describe GameinfoService, type: :service do
       expect(nats).to have_received(:close)
     end
 
+    it 'forgets the event when Sidekiq kills the job while publishing' do
+      pages[events_url(0)] = [event(1)]
+      allow(nats).to receive(:send).and_raise(Sidekiq::Shutdown)
+
+      expect { subject.poll_events }.to raise_error(Sidekiq::Shutdown)
+      expect(redis.exists?('gameinfo:killevent:1')).to be(false)
+    end
+
+    it 'sends run metrics' do
+      allow(ActiveSupport::Notifications).to receive(:instrument)
+      pages[events_url(0)] = [event(2), event(1)]
+      subject.poll_events
+
+      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
+        'metrics.gameinfo_service',
+        { server_id: 'west', job: 'events', published: 2, timed_out: 0, lag_seconds: kind_of(Integer) }
+      )
+    end
+
+    it 'sends a metric when the run is skipped' do
+      allow(ActiveSupport::Notifications).to receive(:instrument)
+      redis.set('gameinfo:lock:events', 'other')
+      subject.poll_events
+
+      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
+        'metrics.gameinfo_service', { server_id: 'west', job: 'events', skipped: 1 }
+      )
+    end
+
     it 'adds a different cache breaker to every request' do
       pages[events_url(0)] = [event(1)]
       subject.poll_events
@@ -151,7 +180,7 @@ RSpec.describe GameinfoService, type: :service do
   end
 
   describe '#poll_battles' do
-    it 'publishes each listed battle once' do
+    it 'publishes each listed battle once and stops at the first page without new battles' do
       pages[battles_url(0)] = [battle(2), battle(1)]
       pages[battles_url(51)] = [battle(1)]
       subject.poll_battles
@@ -159,7 +188,20 @@ RSpec.describe GameinfoService, type: :service do
 
       expect(nats).to have_received(:send).with('battles.deduped', battle(2).to_json).once
       expect(nats).to have_received(:send).with('battles.deduped', battle(1).to_json).once
-      expect(HTTParty).to have_received(:get).with(battles_url(102), anything).twice
+      expect(HTTParty).to have_received(:get).with(battles_url(0), anything).twice
+      expect(HTTParty).to have_received(:get).with(battles_url(51), anything).once
+      expect(HTTParty).not_to have_received(:get).with(battles_url(102), anything)
+    end
+
+    it 'sends run metrics' do
+      allow(ActiveSupport::Notifications).to receive(:instrument)
+      pages[battles_url(0)] = [battle(1)]
+      subject.poll_battles
+
+      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
+        'metrics.gameinfo_service',
+        { server_id: 'west', job: 'battles', published: 1, backfilled: 0, timed_out: 0, lag_seconds: kind_of(Integer) }
+      )
     end
 
     describe 'backfill' do
@@ -221,7 +263,7 @@ RSpec.describe GameinfoService, type: :service do
   end
 
   def battle(id)
-    { 'id' => id, 'totalKills' => 3 }
+    { 'id' => id, 'totalKills' => 3, 'endTime' => '2026-10-15T15:20:05.535053800Z' }
   end
 
   def track_battle(battle_id, kills:, last_kill_at:)

@@ -46,6 +46,7 @@ class GameinfoService
       offset = 0
       pages_at_once = 1
       done = false
+      lag_seconds = nil
 
       while !done && offset <= EVENTS_MAX_OFFSET && time_left?
         offsets = (0...pages_at_once).map { |i| offset + i * PAGE_SIZE }.select { |o| o <= EVENTS_MAX_OFFSET }
@@ -58,6 +59,7 @@ class GameinfoService
             next
           end
 
+          lag_seconds ||= seconds_since(events.map { |event| event['TimeStamp'] }.compact.max)
           new_events = events.select { |event| publish_once(kill_event_key(event['EventId']), KILL_EVENTS_TOPIC, event) }
           new_events.each { |event| track_battle(event) }
           published += new_events.size
@@ -68,24 +70,33 @@ class GameinfoService
 
       log('poll_events', published: published, offset: offset, timed_out: !time_left?)
       log('poll_events', message: 'every page up to the max offset had new events, older events were missed') if !done && offset > EVENTS_MAX_OFFSET
+      instrument('events', published: published, timed_out: time_left? ? 0 : 1, lag_seconds: lag_seconds)
     end
   end
 
+  # Pages through the battles list until a page has nothing new. Battles that show up later
+  # deeper in the list are picked up by the backfill.
   def poll_battles
     with_lock('battles') do
       published = 0
       offset = 0
+      lag_seconds = nil
 
       while offset <= BATTLES_MAX_OFFSET && time_left?
         battles = get_json("/api/gameinfo/battles?sort=recent&limit=#{PAGE_SIZE}&offset=#{offset}")
         break unless battles.is_a?(Array) && battles.any?
 
-        battles.each { |battle| published += 1 if publish_battle(battle) }
+        lag_seconds ||= seconds_since(battles.map { |battle| battle['endTime'] }.compact.max)
+        new_battles = battles.count { |battle| publish_battle(battle) }
+        published += new_battles
+        break if new_battles.zero?
+
         offset += PAGE_SIZE
       end
 
       backfilled = backfill_battles
       log('poll_battles', published: published, backfilled: backfilled, timed_out: !time_left?)
+      instrument('battles', published: published, backfilled: backfilled, timed_out: time_left? ? 0 : 1, lag_seconds: lag_seconds)
     end
   end
 
@@ -144,11 +155,12 @@ class GameinfoService
   def publish_once(key, topic, record)
     return false unless @redis.set(key, '1', nx: true, ex: SEEN_TTL_SECONDS)
 
+    sent = false
     nats.send(topic, record.to_json)
-    true
-  rescue StandardError
-    @redis.del(key)
-    raise
+    sent = true
+  ensure
+    # Unmark the record if it was not sent, including when Sidekiq kills the job on shutdown.
+    @redis.del(key) if sent == false
   end
 
   # Only the HTTP calls run in threads; the results are handled in order on the job's thread.
@@ -192,6 +204,7 @@ class GameinfoService
 
     unless @redis.set(key, token, nx: true, ex: LOCK_TTL_SECONDS)
       log(name, message: 'previous run still holds the lock, skipping')
+      instrument(name, skipped: 1)
       return
     end
 
@@ -209,6 +222,16 @@ class GameinfoService
 
   def nats
     @nats ||= NatsService.new(@server_id)
+  end
+
+  # Sent to InfluxDB by ActiveSupportNotificationService, like the dedupe services' metrics.
+  def instrument(job, fields)
+    ActiveSupport::Notifications.instrument('metrics.gameinfo_service', { server_id: @server_id, job: job }.merge(fields).compact)
+  end
+
+  # How far behind the API is: seconds since the newest record it returned.
+  def seconds_since(time)
+    (Time.now - Time.parse(time)).round if time.present?
   end
 
   def kill_event_key(event_id)

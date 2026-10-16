@@ -1,5 +1,5 @@
 class BattlePollWorker
-  include Sidekiq::Job
+  include Sidekiq::Worker
   # Runs on its own queue and Sidekiq process (RUN_MODE=sidekiq_gameinfo) so slow API calls never
   # hold the threads of the main Sidekiq process. The next scheduled run is the retry.
   sidekiq_options queue: :gameinfo, retry: false

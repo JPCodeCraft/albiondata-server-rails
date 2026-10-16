@@ -134,12 +134,35 @@ RSpec.describe GameinfoService, type: :service do
       end
     end
 
-    it 'tracks the battle of each new event' do
+    it 'tracks the battle of each new event by when it was seen' do
+      # The fixture events are more than an hour old, like events first seen during a catch-up.
       pages[events_url(0)] = [event(2, battle_id: 1), event(1, battle_id: 1)]
       subject.poll_events
 
-      expect(redis.hget(GameinfoService::PENDING_BATTLE_KILLS_KEY, '1')).to eq('2')
+      expect(redis.get('gameinfo:battle:1:kills')).to eq('2')
+      expect(redis.ttl('gameinfo:battle:1:kills')).to be_between(1, GameinfoService::BACKFILL_GIVE_UP_SECONDS)
+      expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '1')).to be_within(5).of(Time.now.to_i)
+    end
+
+    it 'drops battles past the give up time when tracking, even if the battles job does not run' do
+      track_battle(9, kills: 3, last_seen_at: 2.hours.ago)
+      pages[events_url(0)] = [event(1)]
+      subject.poll_events
+
+      expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '9')).to be_nil
       expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '1')).to be_present
+    end
+
+    it 'publishes events with a missing or malformed TimeStamp' do
+      pages[events_url(0)] = [event(2).merge('TimeStamp' => 'not a time'), event(1).merge('TimeStamp' => nil)]
+      allow(ActiveSupport::Notifications).to receive(:instrument)
+      subject.poll_events
+
+      expect(nats).to have_received(:send).twice
+      expect(redis.get('gameinfo:lock:events')).to be_nil
+      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
+        'metrics.gameinfo_service', { server_id: 'west', job: 'events', published: 2, timed_out: 0 }
+      )
     end
 
     it 'skips the run when a previous run holds the lock' do
@@ -254,7 +277,7 @@ RSpec.describe GameinfoService, type: :service do
       let(:battle_url) { "#{base_url}/battles/1" }
 
       it 'publishes a tracked battle the list never showed' do
-        track_battle(1, kills: 3, last_kill_at: 20.minutes.ago)
+        track_battle(1, kills: 3, last_seen_at: 20.minutes.ago)
         pages[battle_url] = battle(1)
         subject.poll_battles
 
@@ -263,14 +286,14 @@ RSpec.describe GameinfoService, type: :service do
       end
 
       it 'waits for recent battles' do
-        track_battle(1, kills: 3, last_kill_at: 5.minutes.ago)
+        track_battle(1, kills: 3, last_seen_at: 5.minutes.ago)
         subject.poll_battles
 
         expect(HTTParty).not_to have_received(:get).with(battle_url, anything)
       end
 
       it 'drops battles with fewer than 3 kills without fetching them' do
-        track_battle(1, kills: 2, last_kill_at: 20.minutes.ago)
+        track_battle(1, kills: 2, last_seen_at: 20.minutes.ago)
         subject.poll_battles
 
         expect(HTTParty).not_to have_received(:get).with(battle_url, anything)
@@ -278,7 +301,7 @@ RSpec.describe GameinfoService, type: :service do
       end
 
       it 'keeps retrying a battle that is not found yet' do
-        track_battle(1, kills: 3, last_kill_at: 20.minutes.ago)
+        track_battle(1, kills: 3, last_seen_at: 20.minutes.ago)
         pages[battle_url] = :not_found
         subject.poll_battles
 
@@ -286,13 +309,47 @@ RSpec.describe GameinfoService, type: :service do
       end
 
       it 'gives up on a battle after an hour' do
-        track_battle(1, kills: 3, last_kill_at: 2.hours.ago)
+        track_battle(1, kills: 3, last_seen_at: 2.hours.ago)
         pages[battle_url] = :not_found
         subject.poll_battles
 
         expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '1')).to be_nil
-        expect(redis.hget(GameinfoService::PENDING_BATTLE_KILLS_KEY, '1')).to be_nil
+        expect(redis.exists?('gameinfo:battle:1:kills')).to be(false)
       end
+
+      it 'drops battles that were already published without fetching them' do
+        track_battle(1, kills: 3, last_seen_at: 20.minutes.ago)
+        redis.set('gameinfo:battle:1', '1')
+        subject.poll_battles
+
+        expect(HTTParty).not_to have_received(:get).with(battle_url, anything)
+        expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '1')).to be_nil
+        expect(redis.exists?('gameinfo:battle:1:kills')).to be(false)
+      end
+
+      it 'handles at most BACKFILL_BATCH_SIZE battles per run, oldest first' do
+        stub_const('GameinfoService::BACKFILL_BATCH_SIZE', 2)
+        track_battle(1, kills: 3, last_seen_at: 30.minutes.ago)
+        track_battle(2, kills: 1, last_seen_at: 25.minutes.ago)
+        track_battle(3, kills: 3, last_seen_at: 20.minutes.ago)
+        pages[battle_url] = battle(1)
+        subject.poll_battles
+
+        expect(nats).to have_received(:send).with('battles.deduped', battle(1).to_json)
+        expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '2')).to be_nil
+        expect(HTTParty).not_to have_received(:get).with("#{base_url}/battles/3", anything)
+        expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '3')).to be_present
+      end
+    end
+
+    it 'sends run metrics without the lag when endTime is malformed' do
+      allow(ActiveSupport::Notifications).to receive(:instrument)
+      pages[battles_url(0)] = [battle(1).merge('endTime' => 'not a time')]
+      subject.poll_battles
+
+      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
+        'metrics.gameinfo_service', { server_id: 'west', job: 'battles', published: 1, backfilled: 0, timed_out: 0 }
+      )
     end
   end
 
@@ -312,9 +369,9 @@ RSpec.describe GameinfoService, type: :service do
     { 'id' => id, 'totalKills' => 3, 'endTime' => '2026-10-15T15:20:05.535053800Z' }
   end
 
-  def track_battle(battle_id, kills:, last_kill_at:)
-    redis.zadd(GameinfoService::PENDING_BATTLES_KEY, last_kill_at.to_i, battle_id)
-    redis.hset(GameinfoService::PENDING_BATTLE_KILLS_KEY, battle_id, kills)
+  def track_battle(battle_id, kills:, last_seen_at:)
+    redis.zadd(GameinfoService::PENDING_BATTLES_KEY, last_seen_at.to_i, battle_id)
+    redis.set("gameinfo:battle:#{battle_id}:kills", kills)
   end
 
   def response(code, body)

@@ -29,13 +29,13 @@ class GameinfoService
   BACKFILL_MIN_KILLS = 3
   BACKFILL_DELAY_SECONDS = 15.minutes.to_i
   BACKFILL_GIVE_UP_SECONDS = 1.hour.to_i
+  BACKFILL_BATCH_SIZE = 1000
 
   # Events older than ~1000 places in the feed are gone, so a stale resume point is dropped.
   EVENTS_RESUME_KEY = 'gameinfo:events:resume_below'
   EVENTS_RESUME_TTL_SECONDS = 30.minutes.to_i
 
   PENDING_BATTLES_KEY = 'gameinfo:battles:pending'
-  PENDING_BATTLE_KILLS_KEY = 'gameinfo:battles:pending:kills'
 
   RELEASE_LOCK_SCRIPT = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
 
@@ -127,26 +127,31 @@ class GameinfoService
 
   private
 
-  # Fetches battles seen in kill events that the battles list never showed.
+  # Fetches battles seen in kill events that the battles list never showed, oldest first and at most
+  # BACKFILL_BATCH_SIZE per run.
   def backfill_battles
     published = 0
     now = Time.now.to_i
-    pending = @redis.zrangebyscore(PENDING_BATTLES_KEY, '-inf', now - BACKFILL_DELAY_SECONDS, with_scores: true)
+    pending = @redis.zrangebyscore(PENDING_BATTLES_KEY, '-inf', now - BACKFILL_DELAY_SECONDS,
+                                   with_scores: true, limit: [0, BACKFILL_BATCH_SIZE]).to_h
+    return published if pending.empty?
 
-    pending.each do |battle_id, last_kill_at|
-      kills = @redis.hget(PENDING_BATTLE_KILLS_KEY, battle_id).to_i
-      if kills < BACKFILL_MIN_KILLS || @redis.exists?(battle_key(battle_id))
-        forget_battle(battle_id)
-        next
-      end
+    battle_ids = pending.keys
+    kills = @redis.mget(*battle_ids.map { |battle_id| battle_kills_key(battle_id) })
+    seen = @redis.mget(*battle_ids.map { |battle_id| battle_key(battle_id) })
+    dropped = battle_ids.zip(kills, seen).filter_map do |battle_id, kill_count, seen_mark|
+      battle_id if kill_count.to_i < BACKFILL_MIN_KILLS || seen_mark
+    end
+    forget_battles(*dropped)
 
+    pending.except(*dropped).each do |battle_id, last_seen_at|
       break unless time_left?
 
       battle = get_json("/api/gameinfo/battles/#{battle_id}")
       if battle.is_a?(Hash)
         published += 1 if publish_battle(battle)
-      elsif last_kill_at < now - BACKFILL_GIVE_UP_SECONDS
-        forget_battle(battle_id)
+      elsif last_seen_at < now - BACKFILL_GIVE_UP_SECONDS
+        forget_battles(battle_id)
       end
     end
 
@@ -156,24 +161,32 @@ class GameinfoService
   def publish_battle(battle)
     return false unless publish_once(battle_key(battle['id']), BATTLES_TOPIC, battle)
 
-    forget_battle(battle['id'])
+    forget_battles(battle['id'])
     true
   end
 
+  # Pending battles are scored by when one of their kills was last seen, so a battle seen late still
+  # gets the whole backfill window. Kill counts expire, and battles not seen for BACKFILL_GIVE_UP_SECONDS
+  # are trimmed on every write, so the pending battles stay bounded even when the battles job does not run.
   def track_battle(event)
     battle_id = event['BattleId']
     return if battle_id.blank? || @redis.exists?(battle_key(battle_id))
 
+    now = Time.now.to_i
     @redis.multi do |transaction|
-      transaction.zadd(PENDING_BATTLES_KEY, Time.parse(event['TimeStamp']).to_i, battle_id, gt: true)
-      transaction.hincrby(PENDING_BATTLE_KILLS_KEY, battle_id, 1)
+      transaction.zadd(PENDING_BATTLES_KEY, now, battle_id)
+      transaction.zremrangebyscore(PENDING_BATTLES_KEY, '-inf', now - BACKFILL_GIVE_UP_SECONDS)
+      transaction.incr(battle_kills_key(battle_id))
+      transaction.expire(battle_kills_key(battle_id), BACKFILL_GIVE_UP_SECONDS)
     end
   end
 
-  def forget_battle(battle_id)
+  def forget_battles(*battle_ids)
+    return if battle_ids.empty?
+
     @redis.multi do |transaction|
-      transaction.zrem(PENDING_BATTLES_KEY, battle_id)
-      transaction.hdel(PENDING_BATTLE_KILLS_KEY, battle_id)
+      transaction.zrem(PENDING_BATTLES_KEY, battle_ids)
+      transaction.del(*battle_ids.map { |battle_id| battle_kills_key(battle_id) })
     end
   end
 
@@ -255,8 +268,16 @@ class GameinfoService
   end
 
   # How far behind the API is: seconds since the newest record it returned.
-  def seconds_since(time)
-    (Time.now - Time.parse(time)).round if time.present?
+  def seconds_since(timestamp)
+    time = parse_time(timestamp)
+    (Time.now - time).round if time
+  end
+
+  # Returns nil for a missing or malformed time, so one bad record does not stop the run.
+  def parse_time(timestamp)
+    Time.parse(timestamp) if timestamp.present?
+  rescue ArgumentError, TypeError
+    nil
   end
 
   def kill_event_key(event_id)
@@ -265,6 +286,10 @@ class GameinfoService
 
   def battle_key(battle_id)
     "gameinfo:battle:#{battle_id}"
+  end
+
+  def battle_kills_key(battle_id)
+    "gameinfo:battle:#{battle_id}:kills"
   end
 
   def log(method, data = {})

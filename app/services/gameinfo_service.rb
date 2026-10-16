@@ -63,7 +63,7 @@ class GameinfoService
       lag_seconds = nil
 
       while !caught_up && !failed && offset <= EVENTS_MAX_OFFSET && time_left?
-        offsets = (0...pages_at_once).map { |i| offset + i * PAGE_SIZE }.select { |o| o <= EVENTS_MAX_OFFSET }
+        offsets = (offset..EVENTS_MAX_OFFSET).step(PAGE_SIZE).first(pages_at_once)
         pages = get_json_in_parallel(offsets.map { |o| "/api/gameinfo/events?limit=#{PAGE_SIZE}&offset=#{o}" })
         offset = offsets.last + PAGE_SIZE
 
@@ -93,9 +93,10 @@ class GameinfoService
         @redis.set(EVENTS_RESUME_KEY, [resume_below, oldest_event_id].compact.min, ex: EVENTS_RESUME_TTL_SECONDS)
       end
 
-      log('poll_events', published: published, offset: offset, resume_below: resume_below, timed_out: !time_left?)
+      timed_out = !time_left?
+      log('poll_events', published: published, offset: offset, resume_below: resume_below, timed_out: timed_out)
       log('poll_events', message: 'reached the max offset before catching up, older events were missed') if !caught_up && offset > EVENTS_MAX_OFFSET
-      instrument('events', published: published, timed_out: time_left? ? 0 : 1, lag_seconds: lag_seconds)
+      instrument('events', published: published, timed_out: timed_out ? 1 : 0, lag_seconds: lag_seconds)
     end
   end
 
@@ -120,8 +121,9 @@ class GameinfoService
       end
 
       backfilled = backfill_battles
-      log('poll_battles', published: published, backfilled: backfilled, timed_out: !time_left?)
-      instrument('battles', published: published, backfilled: backfilled, timed_out: time_left? ? 0 : 1, lag_seconds: lag_seconds)
+      timed_out = !time_left?
+      log('poll_battles', published: published, backfilled: backfilled, timed_out: timed_out)
+      instrument('battles', published: published, backfilled: backfilled, timed_out: timed_out ? 1 : 0, lag_seconds: lag_seconds)
     end
   end
 
@@ -134,7 +136,7 @@ class GameinfoService
     now = Time.now.to_i
     pending = @redis.zrangebyscore(PENDING_BATTLES_KEY, '-inf', now - BACKFILL_DELAY_SECONDS,
                                    with_scores: true, limit: [0, BACKFILL_BATCH_SIZE]).to_h
-    return published if pending.empty?
+    return 0 if pending.empty?
 
     battle_ids = pending.keys
     kills = @redis.mget(*battle_ids.map { |battle_id| battle_kills_key(battle_id) })
@@ -193,12 +195,13 @@ class GameinfoService
   def publish_once(key, topic, record)
     return false unless @redis.set(key, '1', nx: true, ex: SEEN_TTL_SECONDS)
 
-    sent = false
-    nats.send(topic, record.to_json)
-    sent = true
-  ensure
-    # Unmark the record if it was not sent, including when Sidekiq kills the job on shutdown.
-    @redis.del(key) if sent == false
+    begin
+      nats.send(topic, record.to_json)
+      sent = true
+    ensure
+      # Unmark the record if it was not sent, including when Sidekiq kills the job on shutdown.
+      @redis.del(key) unless sent
+    end
   end
 
   # Only the HTTP calls run in threads; the results are handled in order on the job's thread.
@@ -206,8 +209,9 @@ class GameinfoService
     paths.map { |path| Thread.new { get_json(path) } }.map(&:value)
   end
 
-  # Returns the parsed body, :not_found on 404, or nil when the request failed.
-  # Rate limits (429), server errors and network errors are retried with a backoff.
+  # Returns the parsed body, or nil when the request failed. A 404 is not logged, since the backfill
+  # gets one for each battle that is not out yet. Rate limits (429), server errors and network errors
+  # are retried with a backoff.
   # The random `_` parameter skips the API's response cache, which serves each page URL
   # from a copy up to ~2 minutes old and makes consecutive pages come from different moments.
   def get_json(path)
@@ -223,7 +227,7 @@ class GameinfoService
                               open_timeout: HTTP_OPEN_TIMEOUT_SECONDS,
                               read_timeout: HTTP_READ_TIMEOUT_SECONDS)
       return JSON.parse(response.body) if response.success?
-      return :not_found if response.code == 404
+      return if response.code == 404
 
       log('get_json', path: path, status: response.code)
       break unless response.code == 429 || response.code >= 500
@@ -241,7 +245,7 @@ class GameinfoService
     token = SecureRandom.uuid
 
     unless @redis.set(key, token, nx: true, ex: LOCK_TTL_SECONDS)
-      log(name, message: 'previous run still holds the lock, skipping')
+      log("poll_#{name}", message: 'previous run still holds the lock, skipping')
       instrument(name, skipped: 1)
       return
     end
@@ -267,15 +271,10 @@ class GameinfoService
     ActiveSupport::Notifications.instrument('metrics.gameinfo_service', { server_id: @server_id, job: job }.merge(fields).compact)
   end
 
-  # How far behind the API is: seconds since the newest record it returned.
+  # How far behind the API is: seconds since the newest record it returned. Returns nil for a missing
+  # or malformed time, so one bad record does not stop the run.
   def seconds_since(timestamp)
-    time = parse_time(timestamp)
-    (Time.now - time).round if time
-  end
-
-  # Returns nil for a missing or malformed time, so one bad record does not stop the run.
-  def parse_time(timestamp)
-    Time.parse(timestamp) if timestamp.present?
+    (Time.now - Time.parse(timestamp)).round if timestamp.present?
   rescue ArgumentError, TypeError
     nil
   end

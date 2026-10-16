@@ -71,50 +71,24 @@ cron_jobs = [
 # Gameinfo polling is opt-in, since its jobs need a RUN_MODE=sidekiq_gameinfo process to work the gameinfo
 # queue. GAMEINFO_ENABLED=true adds the jobs and GAMEINFO_ENABLED=false removes them (load_from_array keeps
 # jobs that are no longer listed). Left unset, a container does not remove the jobs another container added.
-gameinfo_cron_jobs = [
-  {
-    'name'  => 'kill-event-poll-west',
-    'class' => 'KillEventPollWorker',
-    'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
-    'args'  => 'west',
-    'queue' => 'gameinfo'
-  },
-  {
-    'name'  => 'kill-event-poll-east',
-    'class' => 'KillEventPollWorker',
-    'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
-    'args'  => 'east',
-    'queue' => 'gameinfo'
-  },
-  {
-    'name'  => 'kill-event-poll-europe',
-    'class' => 'KillEventPollWorker',
-    'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
-    'args'  => 'europe',
-    'queue' => 'gameinfo'
-  },
-  {
-    'name'  => 'battle-poll-west',
-    'class' => 'BattlePollWorker',
-    'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
-    'args'  => 'west',
-    'queue' => 'gameinfo'
-  },
-  {
-    'name'  => 'battle-poll-east',
-    'class' => 'BattlePollWorker',
-    'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
-    'args'  => 'east',
-    'queue' => 'gameinfo'
-  },
-  {
-    'name'  => 'battle-poll-europe',
-    'class' => 'BattlePollWorker',
-    'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
-    'args'  => 'europe',
-    'queue' => 'gameinfo'
-  },
-]
+gameinfo_cron_jobs = %w[west east europe].flat_map do |server_id|
+  [
+    {
+      'name'  => "kill-event-poll-#{server_id}",
+      'class' => 'KillEventPollWorker',
+      'cron'  => ENV.fetch('GAMEINFO_EVENTS_CRON', '* * * * *'),
+      'args'  => server_id,
+      'queue' => 'gameinfo'
+    },
+    {
+      'name'  => "battle-poll-#{server_id}",
+      'class' => 'BattlePollWorker',
+      'cron'  => ENV.fetch('GAMEINFO_BATTLES_CRON', '*/3 * * * *'),
+      'args'  => server_id,
+      'queue' => 'gameinfo'
+    },
+  ]
+end
 
 unless ENV['SECRET_KEY_BASE_DUMMY']
   Sidekiq::Cron::Job.load_from_array(cron_jobs)

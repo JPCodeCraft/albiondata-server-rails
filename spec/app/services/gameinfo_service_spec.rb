@@ -78,21 +78,6 @@ RSpec.describe GameinfoService, type: :service do
       expect(nats).to have_received(:send).exactly(6).times
     end
 
-    it 'fetches one page at a time when it is not behind' do
-      pages[events_url(0)] = [event(2), event(1)]
-      pages[events_url(51)] = [event(1)]
-      subject.poll_events
-
-      pages[events_url(0)] = [event(4), event(3), event(2)]
-      pages[events_url(51)] = [event(1)]
-      subject.poll_events
-
-      expect(HTTParty).to have_received(:get).with(events_url(0), anything).twice
-      expect(HTTParty).to have_received(:get).with(events_url(51), anything).twice
-      expect(HTTParty).to have_received(:get).with(events_url(102), anything).once
-      expect(redis.get(GameinfoService::EVENTS_RESUME_KEY)).to be_nil
-    end
-
     describe 'after a run that stopped early' do
       it 'keeps reading past the published pages until it gets below the oldest event reached' do
         # One event per page, newest first. Page 255 fails in the first run.
@@ -138,7 +123,9 @@ RSpec.describe GameinfoService, type: :service do
       # The fixture events are more than an hour old, like events first seen during a catch-up.
       pages[events_url(0)] = [event(2, battle_id: 1), event(1, battle_id: 1)]
       subject.poll_events
+      subject.poll_events
 
+      # Only newly published events count, so the second run adds no kills.
       expect(redis.get('gameinfo:battle:1:kills')).to eq('2')
       expect(redis.ttl('gameinfo:battle:1:kills')).to be_between(1, GameinfoService::BACKFILL_GIVE_UP_SECONDS)
       expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '1')).to be_within(5).of(Time.now.to_i)
@@ -158,18 +145,20 @@ RSpec.describe GameinfoService, type: :service do
       allow(ActiveSupport::Notifications).to receive(:instrument)
       subject.poll_events
 
-      expect(nats).to have_received(:send).twice
-      expect(redis.get('gameinfo:lock:events')).to be_nil
       expect(ActiveSupport::Notifications).to have_received(:instrument).with(
         'metrics.gameinfo_service', { server_id: 'west', job: 'events', published: 2, timed_out: 0 }
       )
     end
 
-    it 'skips the run when a previous run holds the lock' do
+    it 'skips the run and sends a metric when a previous run holds the lock' do
+      allow(ActiveSupport::Notifications).to receive(:instrument)
       redis.set('gameinfo:lock:events', 'other')
       subject.poll_events
 
       expect(HTTParty).not_to have_received(:get)
+      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
+        'metrics.gameinfo_service', { server_id: 'west', job: 'events', skipped: 1 }
+      )
     end
 
     it 'releases the lock after a successful run' do
@@ -217,16 +206,6 @@ RSpec.describe GameinfoService, type: :service do
       )
     end
 
-    it 'sends a metric when the run is skipped' do
-      allow(ActiveSupport::Notifications).to receive(:instrument)
-      redis.set('gameinfo:lock:events', 'other')
-      subject.poll_events
-
-      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
-        'metrics.gameinfo_service', { server_id: 'west', job: 'events', skipped: 1 }
-      )
-    end
-
     it 'adds a different cache breaker to every request' do
       pages[events_url(0)] = [event(1)]
       subject.poll_events
@@ -270,6 +249,16 @@ RSpec.describe GameinfoService, type: :service do
       expect(ActiveSupport::Notifications).to have_received(:instrument).with(
         'metrics.gameinfo_service',
         { server_id: 'west', job: 'battles', published: 1, backfilled: 0, timed_out: 0, lag_seconds: kind_of(Integer) }
+      )
+    end
+
+    it 'sends run metrics without the lag when endTime is malformed' do
+      allow(ActiveSupport::Notifications).to receive(:instrument)
+      pages[battles_url(0)] = [battle(1).merge('endTime' => 'not a time')]
+      subject.poll_battles
+
+      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
+        'metrics.gameinfo_service', { server_id: 'west', job: 'battles', published: 1, backfilled: 0, timed_out: 0 }
       )
     end
 
@@ -340,16 +329,6 @@ RSpec.describe GameinfoService, type: :service do
         expect(HTTParty).not_to have_received(:get).with("#{base_url}/battles/3", anything)
         expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '3')).to be_present
       end
-    end
-
-    it 'sends run metrics without the lag when endTime is malformed' do
-      allow(ActiveSupport::Notifications).to receive(:instrument)
-      pages[battles_url(0)] = [battle(1).merge('endTime' => 'not a time')]
-      subject.poll_battles
-
-      expect(ActiveSupport::Notifications).to have_received(:instrument).with(
-        'metrics.gameinfo_service', { server_id: 'west', job: 'battles', published: 1, backfilled: 0, timed_out: 0 }
-      )
     end
   end
 

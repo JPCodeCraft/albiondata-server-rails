@@ -19,6 +19,7 @@ RSpec.describe GameinfoService, type: :service do
       case body
       when :not_found then response(404, '')
       when :error then response(500, '')
+      when :bad_request then response(400, '')
       else response(200, body.to_json)
       end
     end
@@ -80,9 +81,9 @@ RSpec.describe GameinfoService, type: :service do
 
     describe 'after a run that stopped early' do
       it 'keeps reading past the published pages until it gets below the oldest event reached' do
-        # One event per page, newest first. Page 255 fails in the first run.
+        # One event per page, newest first. Page 255 fails in the first run (a 400, which starts no cooldown).
         { 0 => 10, 51 => 9, 102 => 8, 153 => 7, 204 => 6, 306 => 4 }.each { |offset, id| pages[events_url(offset)] = [event(id)] }
-        pages[events_url(255)] = :error
+        pages[events_url(255)] = :bad_request
         subject.poll_events
 
         expect(redis.get(GameinfoService::EVENTS_RESUME_KEY)).to eq('4')
@@ -218,12 +219,83 @@ RSpec.describe GameinfoService, type: :service do
       expect(cache_breakers.uniq.size).to eq(5)
     end
 
-    it 'retries rate limited requests' do
-      allow(HTTParty).to receive(:get).and_return(response(429, ''), response(200, [event(1)].to_json), response(200, [].to_json))
-      subject.poll_events
+    describe 'rate limits and failures' do
+      let(:cooldown_key) { 'gameinfo:cooldown:events' }
 
-      expect(nats).to have_received(:send).with('killevents.deduped', event(1).to_json)
-      expect(subject).to have_received(:sleep).with(2)
+      it 'cools down the endpoint on a 429 without retrying, and skips requests until it ends' do
+        allow(HTTParty).to receive(:get).and_return(response(429, ''))
+        subject.poll_events
+        subject.poll_events
+
+        expect(HTTParty).to have_received(:get).once
+        expect(redis.pttl(cooldown_key)).to be_between(4_000, 5_500)
+      end
+
+      it 'honours Retry-After' do
+        allow(HTTParty).to receive(:get).and_return(response(429, '', 'retry-after' => '120'))
+        subject.poll_events
+
+        expect(redis.pttl(cooldown_key)).to be_between(119_000, 120_500)
+      end
+
+      it 'treats a Cloudflare 1015 page as a rate limit' do
+        allow(HTTParty).to receive(:get).and_return(response(403, 'error code: 1015'))
+        subject.poll_events
+
+        expect(HTTParty).to have_received(:get).once
+        expect(redis.exists?(cooldown_key)).to be(true)
+      end
+
+      it 'retries server errors with a backoff, then cools down the endpoint' do
+        pages[events_url(0)] = :error
+        subject.poll_events
+
+        expect(HTTParty).to have_received(:get).exactly(3).times
+        expect(subject).to have_received(:sleep).with(a_value_between(2, 2.5))
+        expect(subject).to have_received(:sleep).with(a_value_between(4, 4.5))
+        expect(redis.pttl(cooldown_key)).to be_between(29_000, 30_500)
+      end
+
+      it 'doubles the cooldown for consecutive failures and resets it after a success' do
+        pages[events_url(0)] = :error
+        subject.poll_events
+        redis.del(cooldown_key)
+        subject.poll_events
+
+        expect(redis.pttl(cooldown_key)).to be_between(59_000, 60_500)
+
+        redis.del(cooldown_key)
+        pages[events_url(0)] = [event(1)]
+        subject.poll_events
+
+        expect(redis.exists?("#{cooldown_key}:level")).to be(false)
+      end
+
+      it 'does not cool down on other client errors' do
+        pages[events_url(0)] = :bad_request
+        subject.poll_events
+
+        expect(HTTParty).to have_received(:get).once
+        expect(redis.exists?(cooldown_key)).to be(false)
+      end
+
+      it 'cools down events and battles separately' do
+        redis.set(cooldown_key, '1', ex: 60)
+        pages[battles_url(0)] = [battle(1)]
+        subject.poll_battles
+
+        expect(nats).to have_received(:send).with('battles.deduped', battle(1).to_json)
+      end
+
+      it 'sends a cooldown metric' do
+        allow(ActiveSupport::Notifications).to receive(:instrument)
+        allow(HTTParty).to receive(:get).and_return(response(429, ''))
+        subject.poll_events
+
+        expect(ActiveSupport::Notifications).to have_received(:instrument).with(
+          'metrics.gameinfo_service', { server_id: 'west', job: 'events', cooldown_seconds: 5 }
+        )
+      end
     end
   end
 
@@ -306,6 +378,15 @@ RSpec.describe GameinfoService, type: :service do
         expect(redis.exists?('gameinfo:battle:1:kills')).to be(false)
       end
 
+      it 'stops while the battles endpoint is cooling down' do
+        track_battle(1, kills: 3, last_seen_at: 20.minutes.ago)
+        redis.set('gameinfo:cooldown:battles', '1', ex: 60)
+        subject.poll_battles
+
+        expect(HTTParty).not_to have_received(:get)
+        expect(redis.zscore(GameinfoService::PENDING_BATTLES_KEY, '1')).to be_present
+      end
+
       it 'drops battles that were already published without fetching them' do
         track_battle(1, kills: 3, last_seen_at: 20.minutes.ago)
         redis.set('gameinfo:battle:1', '1')
@@ -353,8 +434,8 @@ RSpec.describe GameinfoService, type: :service do
     redis.set("gameinfo:battle:#{battle_id}:kills", kills)
   end
 
-  def response(code, body)
-    double('HTTParty::Response', success?: code == 200, code: code, body: body)
+  def response(code, body, headers = {})
+    double('HTTParty::Response', success?: code == 200, code: code, body: body, headers: headers)
   end
 
   def clear_gameinfo_keys

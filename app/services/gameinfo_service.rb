@@ -25,6 +25,16 @@ class GameinfoService
   MAX_ATTEMPTS = 3
   SEEN_TTL_SECONDS = 1.day.to_i
 
+  # A rate limit (429 or Cloudflare 1015), or a request that still fails after its retries, puts that
+  # endpoint (events or battles, per server) in a cooldown shared by every run and thread. It doubles
+  # with each consecutive one, a Retry-After header can make it longer, and a success resets it.
+  RATE_LIMIT_COOLDOWN_BASE_SECONDS = ENV.fetch('GAMEINFO_RATE_LIMIT_COOLDOWN_BASE_SECONDS', 5).to_i
+  RATE_LIMIT_COOLDOWN_MAX_SECONDS = ENV.fetch('GAMEINFO_RATE_LIMIT_COOLDOWN_MAX_SECONDS', 60).to_i
+  FAILURE_COOLDOWN_BASE_SECONDS = ENV.fetch('GAMEINFO_FAILURE_COOLDOWN_BASE_SECONDS', 30).to_i
+  FAILURE_COOLDOWN_MAX_SECONDS = ENV.fetch('GAMEINFO_FAILURE_COOLDOWN_MAX_SECONDS', 300).to_i
+  COOLDOWN_LEVEL_TTL_SECONDS = 15.minutes.to_i
+  JITTER_MAX_SECONDS = 0.5
+
   # Battles are only listed once they are over, and never when they have fewer than 3 kills.
   BACKFILL_MIN_KILLS = 3
   BACKFILL_DELAY_SECONDS = 15.minutes.to_i
@@ -147,7 +157,7 @@ class GameinfoService
     forget_battles(*dropped)
 
     pending.except(*dropped).each do |battle_id, last_seen_at|
-      break unless time_left?
+      break if !time_left? || cooling_down?('battles')
 
       battle = get_json("/api/gameinfo/battles/#{battle_id}")
       if battle.is_a?(Hash)
@@ -209,16 +219,19 @@ class GameinfoService
     paths.map { |path| Thread.new { get_json(path) } }.map(&:value)
   end
 
-  # Returns the parsed body, or nil when the request failed. A 404 is not logged, since the backfill
-  # gets one for each battle that is not out yet. Rate limits (429), server errors and network errors
-  # are retried with a backoff.
+  # Returns the parsed body, or nil when the request failed or its endpoint is cooling down. A 404 is
+  # not logged, since the backfill gets one for each battle that is not out yet. Server and network
+  # errors are retried with a backoff; a rate limit is not retried but starts a cooldown.
   # The random `_` parameter skips the API's response cache, which serves each page URL
   # from a copy up to ~2 minutes old and makes consecutive pages come from different moments.
   def get_json(path)
+    endpoint = path.start_with?('/api/gameinfo/events') ? 'events' : 'battles'
+    return if cooling_down?(endpoint)
+
     MAX_ATTEMPTS.times do |attempt|
       if attempt > 0
         break unless time_left?
-        sleep(2**attempt)
+        sleep(2**attempt + jitter)
       end
 
       response = HTTParty.get("#{BASE_URLS.fetch(@server_id)}#{path}",
@@ -226,16 +239,65 @@ class GameinfoService
                               headers: { 'User-Agent' => 'AlbionDataServer' },
                               open_timeout: HTTP_OPEN_TIMEOUT_SECONDS,
                               read_timeout: HTTP_READ_TIMEOUT_SECONDS)
-      return JSON.parse(response.body) if response.success?
+      if response.success?
+        @redis.del(cooldown_level_key(endpoint))
+        return JSON.parse(response.body)
+      end
       return if response.code == 404
 
       log('get_json', path: path, status: response.code)
-      break unless response.code == 429 || response.code >= 500
+      if response.code == 429 || response.body.to_s.include?('1015')
+        start_cooldown(endpoint, RATE_LIMIT_COOLDOWN_BASE_SECONDS, RATE_LIMIT_COOLDOWN_MAX_SECONDS, retry_after(response))
+        return
+      end
+      return if response.code < 500
     rescue StandardError => e
       log('get_json', path: path, error: e.message)
     end
 
+    start_cooldown(endpoint, FAILURE_COOLDOWN_BASE_SECONDS, FAILURE_COOLDOWN_MAX_SECONDS)
     nil
+  end
+
+  def cooling_down?(endpoint)
+    @redis.exists?(cooldown_key(endpoint))
+  end
+
+  def start_cooldown(endpoint, base_seconds, max_seconds, retry_after = nil)
+    level = @redis.multi do |transaction|
+      transaction.incr(cooldown_level_key(endpoint))
+      transaction.expire(cooldown_level_key(endpoint), COOLDOWN_LEVEL_TTL_SECONDS)
+    end.first
+    seconds = [[base_seconds * 2**(level - 1), max_seconds].min, retry_after.to_i].max + jitter
+    # Parallel requests can start cooldowns at the same time; never shorten a longer one.
+    return if @redis.pttl(cooldown_key(endpoint)) >= seconds * 1000
+
+    @redis.set(cooldown_key(endpoint), '1', px: (seconds * 1000).round)
+    log('get_json', endpoint: endpoint, cooldown_seconds: seconds.round(1))
+    instrument(endpoint, cooldown_seconds: seconds.round)
+  end
+
+  # Retry-After in seconds or as an HTTP date; nil when missing or unreadable.
+  def retry_after(response)
+    value = response.headers&.[]('retry-after')
+    return if value.blank?
+    return value.to_i if value.match?(/\A\d+\z/)
+
+    [(Time.httpdate(value) - Time.now).ceil, 0].max
+  rescue ArgumentError
+    nil
+  end
+
+  def jitter
+    rand * JITTER_MAX_SECONDS
+  end
+
+  def cooldown_key(endpoint)
+    "gameinfo:cooldown:#{endpoint}"
+  end
+
+  def cooldown_level_key(endpoint)
+    "#{cooldown_key(endpoint)}:level"
   end
 
   # Only one run per job and server at a time. The lock is released when the run finishes

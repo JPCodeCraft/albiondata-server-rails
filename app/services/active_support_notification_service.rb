@@ -147,7 +147,7 @@ class ActiveSupportNotificationService
   def self.gameinfo_service(payload)
     measurement = 'gameinfo'
     tags = { server_id: payload['server_id'], job: payload['job'] }
-    fields = payload.slice('published', 'backfilled', 'timed_out', 'skipped', 'lag_seconds')
+    fields = payload.slice('published', 'backfilled', 'timed_out', 'skipped', 'lag_seconds', 'cooldown_seconds')
     write_data(measurement, tags, fields)
   end
 

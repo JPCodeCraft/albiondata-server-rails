@@ -79,6 +79,18 @@ RSpec.describe GameinfoService, type: :service do
       expect(nats).to have_received(:send).exactly(6).times
     end
 
+    it 'leaves no resume point after runs that catch up' do
+      pages[events_url(0)] = [event(2), event(1)]
+      subject.poll_events
+
+      expect(redis.exists?(GameinfoService::EVENTS_RESUME_KEY)).to be(false)
+
+      pages[events_url(0)] = [event(3), event(2)]
+      subject.poll_events
+
+      expect(redis.exists?(GameinfoService::EVENTS_RESUME_KEY)).to be(false)
+    end
+
     describe 'after a run that stopped early' do
       it 'keeps reading past the published pages until it gets below the oldest event reached' do
         # One event per page, newest first. Page 255 fails in the first run (a 400, which starts no cooldown).

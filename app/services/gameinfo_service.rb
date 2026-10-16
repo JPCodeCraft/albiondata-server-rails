@@ -30,6 +30,10 @@ class GameinfoService
   BACKFILL_DELAY_SECONDS = 15.minutes.to_i
   BACKFILL_GIVE_UP_SECONDS = 1.hour.to_i
 
+  # Events older than ~1000 places in the feed are gone, so a stale resume point is dropped.
+  EVENTS_RESUME_KEY = 'gameinfo:events:resume_below'
+  EVENTS_RESUME_TTL_SECONDS = 30.minutes.to_i
+
   PENDING_BATTLES_KEY = 'gameinfo:battles:pending'
   PENDING_BATTLE_KILLS_KEY = 'gameinfo:battles:pending:kills'
 
@@ -40,38 +44,57 @@ class GameinfoService
     @redis = REDIS[server_id]
   end
 
-  # Pages through the feed until a page has nothing new. A page with only new events means the
-  # run is behind, so the next pages are then fetched EVENTS_PARALLEL_PAGES at a time.
+  # Pages through the feed (newest first) until a page has nothing new. A page with only new events
+  # means the run is behind, so the next pages are then fetched EVENTS_PARALLEL_PAGES at a time.
+  #
+  # A run that stops early (a failed page or the time limit) leaves unread events below what it
+  # published, and the next run would stop at those published pages. So it stores the oldest
+  # EventId it reached, and later runs do not stop at a page without new events until they get
+  # below it.
   def poll_events
     with_lock('events') do
       published = 0
       offset = 0
-      pages_at_once = 1
-      done = false
+      resume_below = @redis.get(EVENTS_RESUME_KEY)&.to_i
+      pages_at_once = resume_below ? EVENTS_PARALLEL_PAGES : 1
+      caught_up = false
+      failed = false
+      oldest_event_id = nil
       lag_seconds = nil
 
-      while !done && offset <= EVENTS_MAX_OFFSET && time_left?
+      while !caught_up && !failed && offset <= EVENTS_MAX_OFFSET && time_left?
         offsets = (0...pages_at_once).map { |i| offset + i * PAGE_SIZE }.select { |o| o <= EVENTS_MAX_OFFSET }
         pages = get_json_in_parallel(offsets.map { |o| "/api/gameinfo/events?limit=#{PAGE_SIZE}&offset=#{o}" })
         offset = offsets.last + PAGE_SIZE
 
         pages.each do |events|
-          unless events.is_a?(Array) && events.any?
-            done = true
+          if !events.is_a?(Array)
+            failed = true
+            next
+          elsif events.empty?
+            caught_up = true
             next
           end
 
+          event_ids = events.map { |event| event['EventId'] }
+          oldest_event_id = [oldest_event_id, *event_ids].compact.min
           lag_seconds ||= seconds_since(events.map { |event| event['TimeStamp'] }.compact.max)
           new_events = events.select { |event| publish_once(kill_event_key(event['EventId']), KILL_EVENTS_TOPIC, event) }
           new_events.each { |event| track_battle(event) }
           published += new_events.size
-          done = true if new_events.empty?
+          caught_up = true if new_events.empty? && (resume_below.nil? || event_ids.max < resume_below)
           pages_at_once = EVENTS_PARALLEL_PAGES if new_events.size == events.size
         end
       end
 
-      log('poll_events', published: published, offset: offset, timed_out: !time_left?)
-      log('poll_events', message: 'every page up to the max offset had new events, older events were missed') if !done && offset > EVENTS_MAX_OFFSET
+      if (caught_up && !failed) || offset > EVENTS_MAX_OFFSET
+        @redis.del(EVENTS_RESUME_KEY)
+      elsif oldest_event_id
+        @redis.set(EVENTS_RESUME_KEY, [resume_below, oldest_event_id].compact.min, ex: EVENTS_RESUME_TTL_SECONDS)
+      end
+
+      log('poll_events', published: published, offset: offset, resume_below: resume_below, timed_out: !time_left?)
+      log('poll_events', message: 'reached the max offset before catching up, older events were missed') if !caught_up && offset > EVENTS_MAX_OFFSET
       instrument('events', published: published, timed_out: time_left? ? 0 : 1, lag_seconds: lag_seconds)
     end
   end

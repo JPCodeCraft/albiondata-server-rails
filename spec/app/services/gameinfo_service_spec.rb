@@ -16,7 +16,11 @@ RSpec.describe GameinfoService, type: :service do
     allow(subject).to receive(:sleep)
     allow(HTTParty).to receive(:get) do |url, **_options|
       body = pages.fetch(url, [])
-      body == :not_found ? response(404, '') : response(200, body.to_json)
+      case body
+      when :not_found then response(404, '')
+      when :error then response(500, '')
+      else response(200, body.to_json)
+      end
     end
   end
 
@@ -86,6 +90,48 @@ RSpec.describe GameinfoService, type: :service do
       expect(HTTParty).to have_received(:get).with(events_url(0), anything).twice
       expect(HTTParty).to have_received(:get).with(events_url(51), anything).twice
       expect(HTTParty).to have_received(:get).with(events_url(102), anything).once
+      expect(redis.get(GameinfoService::EVENTS_RESUME_KEY)).to be_nil
+    end
+
+    describe 'after a run that stopped early' do
+      it 'keeps reading past the published pages until it gets below the oldest event reached' do
+        # One event per page, newest first. Page 255 fails in the first run.
+        { 0 => 10, 51 => 9, 102 => 8, 153 => 7, 204 => 6, 306 => 4 }.each { |offset, id| pages[events_url(offset)] = [event(id)] }
+        pages[events_url(255)] = :error
+        subject.poll_events
+
+        expect(redis.get(GameinfoService::EVENTS_RESUME_KEY)).to eq('4')
+        expect(nats).not_to have_received(:send).with('killevents.deduped', event(5).to_json)
+
+        # The next run finds the first pages already published but keeps going down to the gap.
+        pages[events_url(255)] = [event(5)]
+        subject.poll_events
+
+        expect(nats).to have_received(:send).with('killevents.deduped', event(5).to_json)
+        expect(redis.get(GameinfoService::EVENTS_RESUME_KEY)).to be_nil
+      end
+
+      it 'stops at a page without new events once it is below the resume point' do
+        pages[events_url(0)] = [event(6), event(5)]
+        pages[events_url(51)] = [event(4), event(3)]
+        pages[events_url(102)] = [event(2), event(1)]
+        pages[events_url(153)] = [event(0)]
+        subject.poll_events
+        redis.set(GameinfoService::EVENTS_RESUME_KEY, 3)
+
+        subject.poll_events
+
+        expect(redis.get(GameinfoService::EVENTS_RESUME_KEY)).to be_nil
+        expect(HTTParty).to have_received(:get).with(events_url(102), anything).twice
+      end
+
+      it 'keeps the resume point when the run reads nothing' do
+        redis.set(GameinfoService::EVENTS_RESUME_KEY, 3)
+        pages[events_url(0)] = :error
+        subject.poll_events
+
+        expect(redis.get(GameinfoService::EVENTS_RESUME_KEY)).to eq('3')
+      end
     end
 
     it 'tracks the battle of each new event' do

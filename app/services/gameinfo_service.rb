@@ -15,11 +15,10 @@ class GameinfoService
   BATTLES_MAX_OFFSET = ENV.fetch('GAMEINFO_BATTLES_MAX_OFFSET', 500).to_i
 
   LOCK_TTL_SECONDS = ENV.fetch('GAMEINFO_LOCK_TTL_SECONDS', 180).to_i
+  # Keep LOCK_TTL_SECONDS well above MAX_RUNTIME_SECONDS: a run stops starting requests at the limit, but
+  # a request in flight can run past it by HTTP_OPEN_TIMEOUT_SECONDS + HTTP_READ_TIMEOUT_SECONDS or more
+  # (the read timeout applies to each read).
   MAX_RUNTIME_SECONDS = ENV.fetch('GAMEINFO_MAX_RUNTIME_SECONDS', 60).to_i
-  # The API is often slow. A run stops starting requests after MAX_RUNTIME_SECONDS, but a request in
-  # flight can still take HTTP_OPEN_TIMEOUT_SECONDS + HTTP_READ_TIMEOUT_SECONDS or more (the read timeout
-  # applies to each read, so a slowly streamed response can take longer). A slow West run took 177s with a
-  # 90s limit, so the limit leaves ~2 minutes of margin within LOCK_TTL_SECONDS.
   HTTP_OPEN_TIMEOUT_SECONDS = 10
   HTTP_READ_TIMEOUT_SECONDS = ENV.fetch('GAMEINFO_HTTP_READ_TIMEOUT_SECONDS', 60).to_i
   MAX_ATTEMPTS = 3
@@ -55,7 +54,8 @@ class GameinfoService
   end
 
   # Pages through the feed (newest first) until a page has nothing new. A page with only new events
-  # means the run is behind, so the next pages are then fetched EVENTS_PARALLEL_PAGES at a time.
+  # means the run is behind, so the next batches of pages double in size, up to EVENTS_PARALLEL_PAGES
+  # fetched at a time.
   #
   # A run that stops early (a failed page or the time limit) leaves unread events below what it
   # published, and the next run would stop at those published pages. So it stores the oldest
@@ -74,10 +74,9 @@ class GameinfoService
 
       while !caught_up && !failed && offset <= EVENTS_MAX_OFFSET && time_left?
         offsets = (offset..EVENTS_MAX_OFFSET).step(PAGE_SIZE).first(pages_at_once)
-        pages = get_json_in_parallel(offsets.map { |o| "/api/gameinfo/events?limit=#{PAGE_SIZE}&offset=#{o}" })
         offset = offsets.last + PAGE_SIZE
 
-        pages.each do |events|
+        get_json_in_parallel(offsets.map { |o| "/api/gameinfo/events?limit=#{PAGE_SIZE}&offset=#{o}" }).each do |events|
           if !events.is_a?(Array)
             failed = true
             next
@@ -88,12 +87,12 @@ class GameinfoService
 
           event_ids = events.map { |event| event['EventId'] }
           oldest_event_id = [oldest_event_id, *event_ids].compact.min
-          lag_seconds ||= seconds_since(events.map { |event| event['TimeStamp'] }.compact.max)
-          new_events = events.select { |event| publish_once(kill_event_key(event['EventId']), KILL_EVENTS_TOPIC, event) }
-          new_events.each { |event| track_battle(event) }
+          lag_seconds ||= seconds_since(events, 'TimeStamp')
+          new_events = publish_new(events, KILL_EVENTS_TOPIC) { |event| kill_event_key(event['EventId']) }
+          track_battles(new_events)
           published += new_events.size
           caught_up = true if new_events.empty? && (resume_below.nil? || event_ids.max < resume_below)
-          pages_at_once = EVENTS_PARALLEL_PAGES if new_events.size == events.size
+          pages_at_once = [pages_at_once * 2, EVENTS_PARALLEL_PAGES].min if new_events.size == events.size
         end
       end
 
@@ -103,10 +102,9 @@ class GameinfoService
         @redis.set(EVENTS_RESUME_KEY, [resume_below, oldest_event_id].compact.min, ex: EVENTS_RESUME_TTL_SECONDS)
       end
 
-      timed_out = !time_left?
-      log('poll_events', published: published, offset: offset, resume_below: resume_below, timed_out: timed_out)
-      log('poll_events', message: 'reached the max offset before catching up, older events were missed') if !caught_up && offset > EVENTS_MAX_OFFSET
-      instrument('events', published: published, timed_out: timed_out ? 1 : 0, lag_seconds: lag_seconds)
+      # missed_older: the scan reached the max offset before catching up, so older events were missed.
+      { published: published, lag_seconds: lag_seconds, offset: offset, resume_below: resume_below,
+        missed_older: (true if !caught_up && offset > EVENTS_MAX_OFFSET) }
     end
   end
 
@@ -122,18 +120,15 @@ class GameinfoService
         battles = get_json("/api/gameinfo/battles?sort=recent&limit=#{PAGE_SIZE}&offset=#{offset}")
         break unless battles.is_a?(Array) && battles.any?
 
-        lag_seconds ||= seconds_since(battles.map { |battle| battle['endTime'] }.compact.max)
-        new_battles = battles.count { |battle| publish_battle(battle) }
+        lag_seconds ||= seconds_since(battles, 'endTime')
+        new_battles = publish_battles(battles)
         published += new_battles
         break if new_battles.zero?
 
         offset += PAGE_SIZE
       end
 
-      backfilled = backfill_battles
-      timed_out = !time_left?
-      log('poll_battles', published: published, backfilled: backfilled, timed_out: timed_out)
-      instrument('battles', published: published, backfilled: backfilled, timed_out: timed_out ? 1 : 0, lag_seconds: lag_seconds)
+      { published: published, backfilled: backfill_battles, lag_seconds: lag_seconds }
     end
   end
 
@@ -157,11 +152,11 @@ class GameinfoService
     forget_battles(*dropped)
 
     pending.except(*dropped).each do |battle_id, last_seen_at|
-      break if !time_left? || cooling_down?('battles')
+      break if !time_left? || cooling_down?
 
       battle = get_json("/api/gameinfo/battles/#{battle_id}")
       if battle.is_a?(Hash)
-        published += 1 if publish_battle(battle)
+        published += publish_battles([battle])
       elsif last_seen_at < now - BACKFILL_GIVE_UP_SECONDS
         forget_battles(battle_id)
       end
@@ -170,26 +165,29 @@ class GameinfoService
     published
   end
 
-  def publish_battle(battle)
-    return false unless publish_once(battle_key(battle['id']), BATTLES_TOPIC, battle)
-
-    forget_battles(battle['id'])
-    true
+  # Returns how many of the battles were new.
+  def publish_battles(battles)
+    new_battles = publish_new(battles, BATTLES_TOPIC) { |battle| battle_key(battle['id']) }
+    forget_battles(*new_battles.map { |battle| battle['id'] })
+    new_battles.size
   end
 
   # Pending battles are scored by when one of their kills was last seen, so a battle seen late still
   # gets the whole backfill window. Kill counts expire, and battles not seen for BACKFILL_GIVE_UP_SECONDS
   # are trimmed on every write, so the pending battles stay bounded even when the battles job does not run.
-  def track_battle(event)
-    battle_id = event['BattleId']
-    return if battle_id.blank? || @redis.exists?(battle_key(battle_id))
+  # Battles that were already published are dropped by the backfill before any lookup.
+  def track_battles(events)
+    kills = events.filter_map { |event| event['BattleId'].presence }.tally
+    return if kills.empty?
 
     now = Time.now.to_i
     @redis.multi do |transaction|
-      transaction.zadd(PENDING_BATTLES_KEY, now, battle_id)
+      transaction.zadd(PENDING_BATTLES_KEY, kills.keys.map { |battle_id| [now, battle_id] })
       transaction.zremrangebyscore(PENDING_BATTLES_KEY, '-inf', now - BACKFILL_GIVE_UP_SECONDS)
-      transaction.incr(battle_kills_key(battle_id))
-      transaction.expire(battle_kills_key(battle_id), BACKFILL_GIVE_UP_SECONDS)
+      kills.each do |battle_id, count|
+        transaction.incrby(battle_kills_key(battle_id), count)
+        transaction.expire(battle_kills_key(battle_id), BACKFILL_GIVE_UP_SECONDS)
+      end
     end
   end
 
@@ -202,20 +200,28 @@ class GameinfoService
     end
   end
 
-  def publish_once(key, topic, record)
-    return false unless @redis.set(key, '1', nx: true, ex: SEEN_TTL_SECONDS)
-
-    begin
+  # Marks the records as published with one pipelined SET NX per record, sends the ones that were not
+  # marked before, and returns them. Records that were not sent are unmarked again, including when
+  # Sidekiq kills the job on shutdown.
+  def publish_new(records, topic, &key)
+    keys = records.map(&key)
+    marked = @redis.pipelined { |pipeline| keys.each { |k| pipeline.set(k, '1', nx: true, ex: SEEN_TTL_SECONDS) } }
+    new_records = records.zip(keys, marked).select(&:last)
+    sent = 0
+    new_records.each do |record, _key|
       nats.send(topic, record.to_json)
-      sent = true
-    ensure
-      # Unmark the record if it was not sent, including when Sidekiq kills the job on shutdown.
-      @redis.del(key) unless sent
+      sent += 1
     end
+    new_records.map(&:first)
+  ensure
+    unsent_keys = new_records.to_a.drop(sent.to_i).map { |_record, k| k }
+    @redis.del(*unsent_keys) if unsent_keys.any?
   end
 
   # Only the HTTP calls run in threads; the results are handled in order on the job's thread.
   def get_json_in_parallel(paths)
+    return [get_json(paths.first)] if paths.one?
+
     paths.map { |path| Thread.new { get_json(path) } }.map(&:value)
   end
 
@@ -225,8 +231,7 @@ class GameinfoService
   # The random `_` parameter skips the API's response cache, which serves each page URL
   # from a copy up to ~2 minutes old and makes consecutive pages come from different moments.
   def get_json(path)
-    endpoint = path.start_with?('/api/gameinfo/events') ? 'events' : 'battles'
-    return if cooling_down?(endpoint)
+    return if cooling_down?
 
     MAX_ATTEMPTS.times do |attempt|
       if attempt > 0
@@ -240,14 +245,14 @@ class GameinfoService
                               open_timeout: HTTP_OPEN_TIMEOUT_SECONDS,
                               read_timeout: HTTP_READ_TIMEOUT_SECONDS)
       if response.success?
-        @redis.del(cooldown_level_key(endpoint))
+        @redis.del(cooldown_level_key)
         return JSON.parse(response.body)
       end
       return if response.code == 404
 
       log('get_json', path: path, status: response.code)
       if response.code == 429 || response.body.to_s.include?('1015')
-        start_cooldown(endpoint, RATE_LIMIT_COOLDOWN_BASE_SECONDS, RATE_LIMIT_COOLDOWN_MAX_SECONDS, retry_after(response))
+        start_cooldown(RATE_LIMIT_COOLDOWN_BASE_SECONDS, RATE_LIMIT_COOLDOWN_MAX_SECONDS, response.headers['retry-after'].to_i)
         return
       end
       return if response.code < 500
@@ -255,65 +260,60 @@ class GameinfoService
       log('get_json', path: path, error: e.message)
     end
 
-    start_cooldown(endpoint, FAILURE_COOLDOWN_BASE_SECONDS, FAILURE_COOLDOWN_MAX_SECONDS)
+    start_cooldown(FAILURE_COOLDOWN_BASE_SECONDS, FAILURE_COOLDOWN_MAX_SECONDS)
     nil
   end
 
-  def cooling_down?(endpoint)
-    @redis.exists?(cooldown_key(endpoint))
+  # Cooldowns are per job (the events or battles endpoint) and server.
+  def cooling_down?
+    @redis.exists?(cooldown_key)
   end
 
-  def start_cooldown(endpoint, base_seconds, max_seconds, retry_after = nil)
+  # retry_after is the Retry-After header in seconds (0 when missing or given as a date).
+  def start_cooldown(base_seconds, max_seconds, retry_after = 0)
     level = @redis.multi do |transaction|
-      transaction.incr(cooldown_level_key(endpoint))
-      transaction.expire(cooldown_level_key(endpoint), COOLDOWN_LEVEL_TTL_SECONDS)
+      transaction.incr(cooldown_level_key)
+      transaction.expire(cooldown_level_key, COOLDOWN_LEVEL_TTL_SECONDS)
     end.first
-    seconds = [[base_seconds * 2**(level - 1), max_seconds].min, retry_after.to_i].max + jitter
+    seconds = [[base_seconds * 2**(level - 1), max_seconds].min, retry_after].max + jitter
     # Parallel requests can start cooldowns at the same time; never shorten a longer one.
-    return if @redis.pttl(cooldown_key(endpoint)) >= seconds * 1000
+    return if @redis.pttl(cooldown_key) >= seconds * 1000
 
-    @redis.set(cooldown_key(endpoint), '1', px: (seconds * 1000).round)
-    log('get_json', endpoint: endpoint, cooldown_seconds: seconds.round(1))
-    instrument(endpoint, cooldown_seconds: seconds.round)
-  end
-
-  # Retry-After in seconds or as an HTTP date; nil when missing or unreadable.
-  def retry_after(response)
-    value = response.headers&.[]('retry-after')
-    return if value.blank?
-    return value.to_i if value.match?(/\A\d+\z/)
-
-    [(Time.httpdate(value) - Time.now).ceil, 0].max
-  rescue ArgumentError
-    nil
+    @redis.set(cooldown_key, '1', px: (seconds * 1000).round)
+    log('get_json', endpoint: @job, cooldown_seconds: seconds.round(1))
+    instrument(cooldown_seconds: seconds.round)
   end
 
   def jitter
     rand * JITTER_MAX_SECONDS
   end
 
-  def cooldown_key(endpoint)
-    "gameinfo:cooldown:#{endpoint}"
+  def cooldown_key
+    "gameinfo:cooldown:#{@job}"
   end
 
-  def cooldown_level_key(endpoint)
-    "#{cooldown_key(endpoint)}:level"
+  def cooldown_level_key
+    "#{cooldown_key}:level"
   end
 
   # Only one run per job and server at a time. The lock is released when the run finishes
-  # successfully, otherwise it expires after LOCK_TTL_SECONDS.
-  def with_lock(name)
-    key = "gameinfo:lock:#{name}"
+  # successfully, otherwise it expires after LOCK_TTL_SECONDS. The block returns the run's fields,
+  # which are logged and sent as metrics (ActiveSupportNotificationService keeps the metric ones).
+  def with_lock(job)
+    @job = job
+    key = "gameinfo:lock:#{job}"
     token = SecureRandom.uuid
 
     unless @redis.set(key, token, nx: true, ex: LOCK_TTL_SECONDS)
-      log("poll_#{name}", message: 'previous run still holds the lock, skipping')
-      instrument(name, skipped: 1)
+      log("poll_#{job}", message: 'previous run still holds the lock, skipping')
+      instrument(skipped: 1)
       return
     end
 
     @deadline = Time.now + MAX_RUNTIME_SECONDS
-    yield
+    fields = yield.compact.merge(timed_out: time_left? ? 0 : 1)
+    log("poll_#{job}", fields)
+    instrument(fields)
     @redis.eval(RELEASE_LOCK_SCRIPT, keys: [key], argv: [token])
   ensure
     @nats&.close
@@ -329,14 +329,15 @@ class GameinfoService
   end
 
   # Sent to InfluxDB by ActiveSupportNotificationService, like the dedupe services' metrics.
-  def instrument(job, fields)
-    ActiveSupport::Notifications.instrument('metrics.gameinfo_service', { server_id: @server_id, job: job }.merge(fields).compact)
+  def instrument(fields)
+    ActiveSupport::Notifications.instrument('metrics.gameinfo_service', { server_id: @server_id, job: @job }.merge(fields).compact)
   end
 
-  # How far behind the API is: seconds since the newest record it returned. Returns nil for a missing
-  # or malformed time, so one bad record does not stop the run.
-  def seconds_since(timestamp)
-    (Time.now - Time.parse(timestamp)).round if timestamp.present?
+  # How far behind the API is: seconds since the newest record's time field. Returns nil when it is
+  # missing or malformed, so one bad record does not stop the run.
+  def seconds_since(records, field)
+    newest = records.filter_map { |record| record[field].presence }.max
+    (Time.now - Time.parse(newest)).round if newest
   rescue ArgumentError, TypeError
     nil
   end

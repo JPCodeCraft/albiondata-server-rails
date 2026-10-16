@@ -56,7 +56,7 @@ RSpec.describe GameinfoService, type: :service do
 
       expect(HTTParty).to have_received(:get).exactly(20).times
       expect(HTTParty).to have_received(:get).with(events_url(969), anything)
-      expect(Sidekiq.logger).to have_received(:info).with(/older events were missed/)
+      expect(Sidekiq.logger).to have_received(:info).with(/"missed_older":true/)
     end
 
     it 'fetches the next pages in parallel once a page has only new events' do
@@ -159,7 +159,10 @@ RSpec.describe GameinfoService, type: :service do
       subject.poll_events
 
       expect(ActiveSupport::Notifications).to have_received(:instrument).with(
-        'metrics.gameinfo_service', { server_id: 'west', job: 'events', published: 2, timed_out: 0 }
+        'metrics.gameinfo_service', hash_including(server_id: 'west', job: 'events', published: 2, timed_out: 0)
+      )
+      expect(ActiveSupport::Notifications).not_to have_received(:instrument).with(
+        'metrics.gameinfo_service', hash_including(:lag_seconds)
       )
     end
 
@@ -200,6 +203,15 @@ RSpec.describe GameinfoService, type: :service do
       expect(nats).to have_received(:close)
     end
 
+    it 'forgets only the events that were not sent when publishing fails partway' do
+      pages[events_url(0)] = [event(2), event(1)]
+      allow(nats).to receive(:send).with('killevents.deduped', event(1).to_json).and_raise('nats down')
+
+      expect { subject.poll_events }.to raise_error('nats down')
+      expect(redis.exists?('gameinfo:killevent:2')).to be(true)
+      expect(redis.exists?('gameinfo:killevent:1')).to be(false)
+    end
+
     it 'forgets the event when Sidekiq kills the job while publishing' do
       pages[events_url(0)] = [event(1)]
       allow(nats).to receive(:send).and_raise(Sidekiq::Shutdown)
@@ -215,7 +227,7 @@ RSpec.describe GameinfoService, type: :service do
 
       expect(ActiveSupport::Notifications).to have_received(:instrument).with(
         'metrics.gameinfo_service',
-        { server_id: 'west', job: 'events', published: 2, timed_out: 0, lag_seconds: kind_of(Integer) }
+        hash_including(server_id: 'west', job: 'events', published: 2, timed_out: 0, lag_seconds: kind_of(Integer))
       )
     end
 
@@ -224,11 +236,11 @@ RSpec.describe GameinfoService, type: :service do
       subject.poll_events
 
       cache_breakers = []
-      expect(HTTParty).to have_received(:get).exactly(5).times do |_url, **options|
+      expect(HTTParty).to have_received(:get).exactly(3).times do |_url, **options|
         cache_breakers << options.dig(:query, :_)
       end
       expect(cache_breakers).to all(match(/\A\h{16}\z/))
-      expect(cache_breakers.uniq.size).to eq(5)
+      expect(cache_breakers.uniq.size).to eq(3)
     end
 
     describe 'rate limits and failures' do

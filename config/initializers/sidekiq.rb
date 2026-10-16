@@ -66,6 +66,12 @@ cron_jobs = [
     'cron'  => '*/30 * * * *',
     'queue' => 'low'
   },
+]
+
+# Gameinfo polling is opt-in, since its jobs need a RUN_MODE=sidekiq_gameinfo process to work the gameinfo
+# queue. GAMEINFO_ENABLED=true adds the jobs and GAMEINFO_ENABLED=false removes them (load_from_array keeps
+# jobs that are no longer listed). Left unset, a container does not remove the jobs another container added.
+gameinfo_cron_jobs = [
   {
     'name'  => 'kill-event-poll-west',
     'class' => 'KillEventPollWorker',
@@ -110,4 +116,11 @@ cron_jobs = [
   },
 ]
 
-Sidekiq::Cron::Job.load_from_array(cron_jobs) unless ENV['SECRET_KEY_BASE_DUMMY']
+unless ENV['SECRET_KEY_BASE_DUMMY']
+  Sidekiq::Cron::Job.load_from_array(cron_jobs)
+
+  case ENV['GAMEINFO_ENABLED']
+  when 'true' then Sidekiq::Cron::Job.load_from_array(gameinfo_cron_jobs)
+  when 'false' then gameinfo_cron_jobs.each { |job| Sidekiq::Cron::Job.destroy(job['name']) }
+  end
+end
